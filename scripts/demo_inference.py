@@ -4,12 +4,12 @@ import os
 import platform
 import sys
 import time
-
+ 
 import numpy as np
 import torch
 from tqdm import tqdm
 import natsort
-
+ 
 from detector.apis import get_detector
 from trackers.tracker_api import Tracker
 from trackers.tracker_cfg import cfg as tcfg
@@ -22,7 +22,7 @@ from alphapose.utils.transforms import flip, flip_heatmap
 from alphapose.utils.vis import getTime
 from alphapose.utils.webcam_detector import WebCamDetectionLoader
 from alphapose.utils.writer import DataWriter
-
+ 
 """----------------------------- Demo options -----------------------------"""
 parser = argparse.ArgumentParser(description='AlphaPose Demo')
 parser.add_argument('--cfg', type=str, required=True,
@@ -83,38 +83,23 @@ parser.add_argument('--pose_flow', dest='pose_flow',
                     help='track humans in video with PoseFlow', action='store_true', default=False)
 parser.add_argument('--pose_track', dest='pose_track',
                     help='track humans in video with reid', action='store_true', default=False)
-
+ 
 args = parser.parse_args()
 cfg = update_config(args.cfg)
-
-if platform.system() == 'Windows':
-    args.sp = True
-
-args.gpus = [int(i) for i in args.gpus.split(',')] if torch.cuda.device_count() >= 1 else [-1]
-args.device = torch.device("cuda:" + str(args.gpus[0]) if args.gpus[0] >= 0 else "cpu")
+ 
+args.gpus = [int(i) for i in args.gpus.split(',')]
+args.device = torch.device("cuda:" + str(args.gpus[0]))
 args.detbatch = args.detbatch * len(args.gpus)
 args.posebatch = args.posebatch * len(args.gpus)
 args.tracking = args.pose_track or args.pose_flow or args.detector=='tracker'
-
-if not args.sp:
-    torch.multiprocessing.set_start_method('forkserver', force=True)
-    torch.multiprocessing.set_sharing_strategy('file_system')
-
-
+ 
+ 
+torch.multiprocessing.set_start_method('forkserver', force=True)
+torch.multiprocessing.set_sharing_strategy('file_system')
+ 
+ 
 def check_input():
-    # for wecam
-    if args.webcam != -1:
-        args.detbatch = 1
-        return 'webcam', int(args.webcam)
-
-    # for video
-    if len(args.video):
-        if os.path.isfile(args.video):
-            videofile = args.video
-            return 'video', videofile
-        else:
-            raise IOError('Error: --video must refer to a video file, not directory.')
-
+ 
     # for detection results
     if len(args.detfile):
         if os.path.isfile(args.detfile):
@@ -122,13 +107,13 @@ def check_input():
             return 'detfile', detfile
         else:
             raise IOError('Error: --detfile must refer to a detection json file, not directory.')
-
+ 
     # for images
     if len(args.inputpath) or len(args.inputlist) or len(args.inputimg):
         inputpath = args.inputpath
         inputlist = args.inputlist
         inputimg = args.inputimg
-
+ 
         if len(inputlist):
             im_names = open(inputlist, 'r').readlines()
         elif len(inputpath) and inputpath != '/':
@@ -138,47 +123,48 @@ def check_input():
         elif len(inputimg):
             args.inputpath = os.path.split(inputimg)[0]
             im_names = [os.path.split(inputimg)[1]]
-
+ 
         return 'image', im_names
-
+ 
     else:
         raise NotImplementedError
-
-
+ 
+ 
 def print_finish_info():
     print('===========================> Finish Model Running.')
     if (args.save_img or args.save_video) and not args.vis_fast:
         print('===========================> Rendering remaining images in the queue...')
         print('===========================> If this step takes too long, you can enable the --vis_fast flag to use fast rendering (real-time).')
-
-
+ 
+ 
 def loop():
     n = 0
     while True:
         yield n
         n += 1
-
-
+ 
+ 
 if __name__ == "__main__":
     mode, input_source = check_input()
-
+ 
+    # path_img = self.image_queue.get()
+        # from IPython.display import Image, display
+        # pil_img = Image(filename=path_img)
+        # display(pil_img)
+ 
+    #print(input_source)
+ 
     if not os.path.exists(args.outputpath):
         os.makedirs(args.outputpath)
-
+ 
+    #print(cfg)
     # Load detection loader
-    if mode == 'webcam':
-        det_loader = WebCamDetectionLoader(input_source, get_detector(args), cfg, args)
-        det_worker = det_loader.start()
-    elif mode == 'detfile':
-        det_loader = FileDetectionLoader(input_source, cfg, args)
-        det_worker = det_loader.start()
-    else:
-        det_loader = DetectionLoader(input_source, get_detector(args), cfg, args, batchSize=args.detbatch, mode=mode, queueSize=args.qsize)
-        det_worker = det_loader.start()
-
+    det_loader = DetectionLoader(input_source, get_detector(args), cfg, args, batchSize=args.detbatch, mode=mode, queueSize=args.qsize)
+    det_worker = det_loader.start()
+ 
     # Load pose model
     pose_model = builder.build_sppe(cfg.MODEL, preset_cfg=cfg.DATA_PRESET)
-
+ 
     print('Loading pose model from %s...' % (args.checkpoint,))
     pose_model.load_state_dict(torch.load(args.checkpoint, map_location=args.device))
     pose_dataset = builder.retrieve_dataset(cfg.DATASET.TRAIN)
@@ -189,34 +175,21 @@ if __name__ == "__main__":
     else:
         pose_model.to(args.device)
     pose_model.eval()
-
+ 
     runtime_profile = {
         'dt': [],
         'pt': [],
         'pn': []
     }
-
+ 
     # Init data writer
-    queueSize = 2 if mode == 'webcam' else args.qsize
-    if args.save_video and mode != 'image':
-        from alphapose.utils.writer import DEFAULT_VIDEO_SAVE_OPT as video_save_opt
-        if mode == 'video':
-            video_save_opt['savepath'] = os.path.join(args.outputpath, 'AlphaPose_' + os.path.basename(input_source))
-        else:
-            video_save_opt['savepath'] = os.path.join(args.outputpath, 'AlphaPose_webcam' + str(input_source) + '.mp4')
-        video_save_opt.update(det_loader.videoinfo)
-        writer = DataWriter(cfg, args, save_video=True, video_save_opt=video_save_opt, queueSize=queueSize).start()
-    else:
-        writer = DataWriter(cfg, args, save_video=False, queueSize=queueSize).start()
-
-    if mode == 'webcam':
-        print('Starting webcam demo, press Ctrl + C to terminate...')
-        sys.stdout.flush()
-        im_names_desc = tqdm(loop())
-    else:
-        data_len = det_loader.length
-        im_names_desc = tqdm(range(data_len), dynamic_ncols=True)
-
+    queueSize = args.qsize
+ 
+    writer = DataWriter(cfg, args, save_video=False, queueSize=queueSize).start()
+ 
+    data_len = det_loader.datalen
+    im_names_desc = tqdm(range(data_len), dynamic_ncols=True)
+ 
     batchSize = args.posebatch
     if args.flip:
         batchSize = int(batchSize / 2)
@@ -224,7 +197,7 @@ if __name__ == "__main__":
         for i in im_names_desc:
             start_time = getTime()
             with torch.no_grad():
-                (inps, orig_img, im_name, boxes, scores, ids, cropped_boxes) = det_loader.read()
+                (inps, orig_img, im_name, boxes, scores, ids, cropped_boxes) = det_loader.wait_and_get(det_loader.pose_queue)
                 if orig_img is None:
                     break
                 if boxes is None or boxes.nelement() == 0:
@@ -261,7 +234,7 @@ if __name__ == "__main__":
                 if args.profile:
                     ckpt_time, post_time = getTime(ckpt_time)
                     runtime_profile['pn'].append(post_time)
-
+ 
             if args.profile:
                 # TQDM
                 im_names_desc.set_description(
@@ -289,9 +262,8 @@ if __name__ == "__main__":
             writer.stop()
         else:
             # subprocesses are killed, manually clear queues
-
+ 
             det_loader.terminate()
             writer.terminate()
             writer.clear_queues()
             det_loader.clear_queues()
-
